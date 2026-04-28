@@ -704,7 +704,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<at::Tensor> sparse_block_table_  // (sparse_num_blocks,) int32, see plan.md
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -734,6 +735,24 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         CHECK_DEVICE(page_table);
         TORCH_CHECK(page_table.dtype() == torch::kInt32, "page_table must have dtype torch.int32");
         TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
+    }
+
+    // Speculative sparse attention (plan.md). A 1D int32 tensor of
+    // block indices; every entry must point to a fully-historical
+    // K/V block (strictly left of the current M-block's Q range).
+    // Mutually exclusive with paged KV.
+    at::Tensor sparse_block_table;
+    const bool use_sparse = sparse_block_table_.has_value();
+    if (use_sparse) {
+        TORCH_CHECK(!paged_KV,
+                    "sparse_block_table is mutually exclusive with page_table (paged KV).");
+        sparse_block_table = sparse_block_table_.value();
+        CHECK_DEVICE(sparse_block_table);
+        CHECK_CONTIGUOUS(sparse_block_table);
+        TORCH_CHECK(sparse_block_table.dtype() == torch::kInt32,
+                    "sparse_block_table must have dtype torch.int32");
+        TORCH_CHECK(sparse_block_table.dim() == 1,
+                    "sparse_block_table must be a 1D tensor of block indices");
     }
 
     at::Tensor cu_seqlens_q;
@@ -925,6 +944,11 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     }
     params.page_size = page_size;
     params.num_pages = num_pages;
+
+    if (use_sparse) {
+        params.sparse_block_table = sparse_block_table.data_ptr<int>();
+        params.sparse_num_blocks = static_cast<int>(sparse_block_table.numel());
+    }
 
     if (k_new_.has_value()) {  // This needs to be set before get_pagedkv_tma
         at::Tensor k_new, v_new;
@@ -1670,7 +1694,7 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
     return {out, softmax_lse};
 }
 
-TORCH_LIBRARY(flash_attn_3, m) {
+TORCH_LIBRARY(sparse_flash_attn_3, m) {
     m.def("fwd("
         "Tensor q,"
         "Tensor k,"
@@ -1705,7 +1729,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? sparse_block_table = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1761,7 +1786,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int sm_margin = 0) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
+TORCH_LIBRARY_IMPL(sparse_flash_attn_3, CUDA, m) {
     m.impl("fwd", &mha_fwd);
     m.impl("bwd", &mha_bwd);
     m.impl("fwd_combine", &mha_combine);

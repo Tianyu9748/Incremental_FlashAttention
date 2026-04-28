@@ -11,9 +11,9 @@ import warnings
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
     try:
-        import flash_attn_3._C
+        import sparse_flash_attn_3._C
     except ImportError:
-        warnings.warn("flash_attn_3._C (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
+        warnings.warn("sparse_flash_attn_3._C (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
         USE_TRITON_ROCM = True
 
 if USE_TRITON_ROCM:
@@ -21,11 +21,11 @@ if USE_TRITON_ROCM:
 else:
     # isort: off
     # We need to import the CUDA kernels after importing torch
-    import flash_attn_3._C # Registers operators with PyTorch
+    import sparse_flash_attn_3._C # Registers operators with PyTorch
 
     # isort: on
 
-    flash_attn_3_gpu = torch.ops.flash_attn_3
+    flash_attn_3_gpu = torch.ops.sparse_flash_attn_3
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -56,7 +56,7 @@ def round_up_headdim(head_size: int) -> int:
     return 256
 
 
-@torch.library.custom_op("flash_attn_3::_flash_attn_forward", mutates_args=(), device_types="cuda")
+@torch.library.custom_op("sparse_flash_attn_3::_flash_attn_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -139,6 +139,7 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         sm_margin,
+        None,  # sparse_block_table (plan.md) — not exposed via the custom_op path
     )
 
     if out_accum is None:
@@ -150,7 +151,7 @@ def _flash_attn_forward(
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
-@torch.library.register_fake("flash_attn_3::_flash_attn_forward")
+@torch.library.register_fake("sparse_flash_attn_3::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -255,7 +256,7 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
-@torch.library.custom_op("flash_attn_3::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@torch.library.custom_op("sparse_flash_attn_3::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -309,7 +310,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@torch.library.register_fake("flash_attn_3::_flash_attn_backward")
+@torch.library.register_fake("sparse_flash_attn_3::_flash_attn_backward")
 def _flash_attn_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -937,6 +938,136 @@ def flash_attn_varlen_func(
 
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
     return flash_attn_3_gpu.fwd_combine(out_partial, lse_partial, out, out_dtype)
+
+
+def flash_attn_with_sparse_block_table(
+    q,
+    k,
+    v,
+    sparse_block_table,
+    softmax_scale=None,
+    sm_margin=0,
+):
+    """Phase-2 sparse missed-block pass (plan.md).
+
+    Runs flash attention over the K/V blocks listed in `sparse_block_table`
+    (1D int32). Every entry must index a fully-historical block, i.e. its
+    last K position must be strictly less than the first Q position of every
+    M-block in `q`. The kernel applies no causal/local mask and performs no
+    paged-KV lookup; inputs must be dense contiguous (batch, seqlen, h, d)
+    tensors. sparse_block_table is shared across batch/head in this version.
+
+    Args:
+        q: (batch, seqlen_q, nheads, head_size)
+        k: (batch, seqlen_k, nheads_k, head_size) — seqlen_k must be a
+            multiple of the kernel's kBlockN.
+        v: (batch, seqlen_k, nheads_k, head_size_v)
+        sparse_block_table: (num_sparse_blocks,) int32 CUDA tensor. Block
+            indices into k/v along the seqlen dimension. If empty the call
+            returns O=0, LSE=-inf (empty partial for combine).
+        softmax_scale: defaults to 1/sqrt(head_size).
+        sm_margin: passthrough to the kernel launch.
+
+    Returns:
+        out: (batch, seqlen_q, nheads, head_size_v)
+        softmax_lse: (batch, nheads, seqlen_q)
+    """
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    sparse_block_table = maybe_contiguous(sparse_block_table)
+    assert sparse_block_table is None or (
+        sparse_block_table.dtype == torch.int32 and sparse_block_table.dim() == 1
+    ), "sparse_block_table must be a 1D int32 CUDA tensor"
+    out, softmax_lse, *_ = flash_attn_3_gpu.fwd(
+        q, k, v,
+        None, None, None, None,          # k_new, v_new, qv, out
+        None, None, None,                # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
+        None, None,                      # seqused_q, seqused_k
+        None, None,                      # max_seqlen_q, max_seqlen_k
+        None,                            # page_table
+        None, None,                      # kv_batch_idx, leftpad_k
+        None, None, None,                # rotary_cos, rotary_sin, seqlens_rotary
+        None, None, None,                # q_descale, k_descale, v_descale
+        softmax_scale,
+        False,                           # is_causal — contract: fully-historical blocks, no mask
+        -1, -1, 0,                       # window_size_left/right, attention_chunk
+        0.0,                             # softcap
+        False,                           # is_rotary_interleaved
+        None,                            # scheduler_metadata
+        1,                               # num_splits — sparse path is non-splitkv
+        None,                            # pack_gqa
+        sm_margin,
+        sparse_block_table,
+    )
+    return out, softmax_lse
+
+
+def flash_attn_speculative_sparse(
+    q,
+    k_spec,
+    v_spec,
+    k,
+    v,
+    sparse_block_table,
+    softmax_scale=None,
+    causal_spec=True,
+    sm_margin=0,
+):
+    """Two-pass speculative + sparse attention with online-softmax combine
+    (plan.md Phase 1 + 2 + 3).
+
+    Pass 1 (dense speculative): flash attention over the speculative K/V
+      tensors `k_spec`/`v_spec` (caller-gathered contiguous block subset,
+      containing the diagonal / most-recent block so default causal masking
+      still applies if `causal_spec=True`).
+    Pass 2 (sparse missed-block): flash attention over the blocks listed
+      in `sparse_block_table`, indexed into the full `k`/`v` tensors. No
+      mask — all entries must be fully-historical per the sparse contract.
+    Combine: online-softmax merge via the FlashAttnFwdCombine kernel.
+
+    Args:
+        q: (batch, seqlen_q, nheads, head_size)
+        k_spec, v_spec: speculative K/V, contiguous dense tensors.
+        k, v: full K/V that sparse_block_table indexes into.
+        sparse_block_table: (num_sparse_blocks,) int32 CUDA tensor.
+        causal_spec: apply causal mask on the speculative pass (default
+            True). The sparse pass is always unmasked.
+
+    Returns:
+        out: (batch, seqlen_q, nheads, head_size_v) (q's dtype)
+        softmax_lse: (batch, nheads, seqlen_q) fp32
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    # Pass 1: speculative dense.
+    o1, lse1, *_ = _flash_attn_forward(
+        q, k_spec, v_spec,
+        softmax_scale=softmax_scale,
+        causal=causal_spec,
+        sm_margin=sm_margin,
+    )
+
+    # Pass 2: sparse missed-block.
+    o2, lse2 = flash_attn_with_sparse_block_table(
+        q, k, v, sparse_block_table,
+        softmax_scale=softmax_scale,
+        sm_margin=sm_margin,
+    )
+
+    # Combine. out_partial expects (num_splits, b, s, h, d) fp32.
+    # lse_partial expects (num_splits, b, s, h) fp32. softmax_lse from
+    # FA is (b, h, s), so transpose to (b, s, h) before stacking.
+    out_partial = torch.stack([o1.to(torch.float32), o2.to(torch.float32)], dim=0)
+    lse_partial = torch.stack([lse1.transpose(-1, -2), lse2.transpose(-1, -2)], dim=0)
+    out, softmax_lse = flash_attn_combine(
+        out_partial.contiguous(),
+        lse_partial.contiguous(),
+        out_dtype=q.dtype,
+    )
+    # flash_attn_combine returns softmax_lse as (b, s, h); transpose back to (b, h, s).
+    return out, softmax_lse.transpose(-1, -2).contiguous()
 
 
 def flash_attn_with_kvcache(

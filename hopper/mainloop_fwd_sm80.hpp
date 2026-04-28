@@ -213,6 +213,8 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        int const* const ptr_sparse_block_table = nullptr;
+        int const sparse_num_blocks = 0;
     };
 
     // Device side kernel params
@@ -259,6 +261,8 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        int const* const ptr_sparse_block_table = nullptr;
+        int const sparse_num_blocks = 0;
     };
 
     static Params
@@ -301,7 +305,8 @@ struct CollectiveMainloopFwdSm80 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.ptr_sparse_block_table, args.sparse_num_blocks};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>

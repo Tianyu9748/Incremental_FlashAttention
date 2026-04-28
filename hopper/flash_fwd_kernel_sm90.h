@@ -352,9 +352,30 @@ public:
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
-                // pipeline_vt won't be used if we don't need to transpose V.
-                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
-                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+                // Speculative sparse attention dispatch (plan.md Phase 2).
+                // The sparse path is only compiled for a restricted set of
+                // template variants (no paged KV, no Transpose_V, no
+                // AppendKV, no HasQv, no LargeHeadDimV, IntraWGOverlap).
+                // For any other variant we always run the dense path; a
+                // runtime check in the host code rejects combinations that
+                // would otherwise set sparse_block_table here.
+                constexpr bool SparsePathSupported =
+                    !AppendKV && !CollectiveMainloop::PagedKVNonTMA && !HasQv &&
+                    !Transpose_V && !LargeHeadDimV && CollectiveMainloop::IsIntraWGOverlap;
+                bool use_sparse_load = false;
+                if constexpr (SparsePathSupported) {
+                    use_sparse_load = params.mainloop.ptr_sparse_block_table != nullptr;
+                }
+                if (use_sparse_load) {
+                    if constexpr (SparsePathSupported) {
+                        mainloop.load_sparse(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+                                             shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+                    }
+                } else {
+                    // pipeline_vt won't be used if we don't need to transpose V.
+                    mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+                                             shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+                }
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
@@ -417,10 +438,29 @@ public:
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
+                // Speculative sparse attention dispatch (plan.md Phase 2).
+                // Mirrors the producer-side dispatch: the sparse consumer path is only
+                // compiled for the same restricted variant set, and is selected at
+                // runtime when ptr_sparse_block_table is set.
+                constexpr bool SparsePathSupported =
+                    !AppendKV && !CollectiveMainloop::PagedKVNonTMA && !HasQv &&
+                    !Transpose_V && !LargeHeadDimV && CollectiveMainloop::IsIntraWGOverlap;
+                bool use_sparse_mma = false;
+                if constexpr (SparsePathSupported) {
+                    use_sparse_mma = params.mainloop.ptr_sparse_block_table != nullptr;
+                }
                 if constexpr (!LargeHeadDimV) {
-                    tile_valid = mainloop.mma(
-                        params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                    if (use_sparse_mma) {
+                        if constexpr (SparsePathSupported) {
+                            tile_valid = mainloop.mma_sparse(
+                                params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                                tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                        }
+                    } else {
+                        tile_valid = mainloop.mma(
+                            params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                            tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                    }
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(

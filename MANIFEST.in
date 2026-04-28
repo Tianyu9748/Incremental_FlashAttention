@@ -5,8 +5,8 @@ recursive-include csrc *.cpp
 recursive-include csrc *.hpp
 recursive-include csrc *.py
 
-recursive-include flash_attn *.cu
-recursive-include flash_attn *.h
-recursive-include flash_attn *.cuh
-recursive-include flash_attn *.cpp
-recursive-include flash_attn *.hpp
+recursive-include sparse_flash_attn_2 *.cu
+recursive-include sparse_flash_attn_2 *.h
+recursive-include sparse_flash_attn_2 *.cuh
+recursive-include sparse_flash_attn_2 *.cpp
+recursive-include sparse_flash_attn_2 *.hpp

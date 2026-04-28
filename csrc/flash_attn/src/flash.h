@@ -104,6 +104,16 @@ struct Flash_fwd_params : public Qkv_params {
     index_t block_table_batch_stride;
     int page_block_size;
 
+    // Speculative sparse attention (see plan.md).
+    // When sparse_block_table != nullptr, the kernel iterates over the listed
+    // K/V block indices instead of the dense [n_block_min, n_block_max) range.
+    // Every entry must index a fully-historical block (strictly left of the
+    // current M-block's query range); the kernel then runs the no-mask fast
+    // path. sparse_block_table is mutually exclusive with the paged-KV
+    // block_table above — callers must set at most one.
+    int * __restrict__ sparse_block_table;
+    int sparse_num_blocks;
+
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
     // uint32_t p_dropout_in_uint;

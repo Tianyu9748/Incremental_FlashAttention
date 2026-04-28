@@ -360,7 +360,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         int window_size_right,
         const float softcap,
         const bool return_softmax,
-        std::optional<at::Generator> gen_) {
+        std::optional<at::Generator> gen_,
+        std::optional<at::Tensor> sparse_block_table_ // (sparse_num_blocks,) int32, plan.md
+        ) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -449,6 +451,27 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         p = torch::empty({ 0 }, opts);
     }
 
+    // Speculative sparse attention (plan.md). A 1D int32 tensor of
+    // block indices; every entry must be a fully-historical K/V block.
+    // The FA-2 dispatch added in stage 3 lives only in
+    // compute_attn_1rowblock (non-splitkv), so we force num_splits=1
+    // when the sparse path is requested.
+    at::Tensor sparse_block_table;
+    const bool use_sparse = sparse_block_table_.has_value();
+    if (use_sparse) {
+        sparse_block_table = sparse_block_table_.value();
+        CHECK_DEVICE(sparse_block_table);
+        CHECK_CONTIGUOUS(sparse_block_table);
+        TORCH_CHECK(sparse_block_table.dtype() == torch::kInt32,
+                    "sparse_block_table must have dtype torch.int32");
+        TORCH_CHECK(sparse_block_table.dim() == 1,
+                    "sparse_block_table must be a 1D tensor of block indices");
+        TORCH_CHECK(p_dropout == 0.f,
+                    "sparse_block_table is not supported with dropout");
+        TORCH_CHECK(!alibi_slopes_.has_value(),
+                    "sparse_block_table is not supported with alibi_slopes");
+    }
+
     Flash_fwd_params params;
     set_params_fprop(params,
                      batch_size,
@@ -469,11 +492,18 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
                      softcap
                      );
 
+    if (use_sparse) {
+        params.sparse_block_table = sparse_block_table.data_ptr<int>();
+        params.sparse_num_blocks = static_cast<int>(sparse_block_table.numel());
+    }
+
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
+    // The sparse path in compute_attn_1rowblock_sparse is compiled only
+    // for the non-splitkv variant; force num_splits=1 here.
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
-        head_size_rounded, p_dropout, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
+        head_size_rounded, p_dropout, /*num_splits*/ use_sparse ? 1 : 0, get_num_sm(get_current_device()), opts);
 
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state

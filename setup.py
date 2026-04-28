@@ -51,7 +51,7 @@ else:
     elif BUILD_TARGET == "rocm":
         IS_ROCM = True
 
-PACKAGE_NAME = "flash_attn"
+PACKAGE_NAME = "sparse_flash_attn_2"
 
 BASE_WHEEL_URL = (
     "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
@@ -251,7 +251,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    check_if_cuda_home_none("flash_attn")
+    check_if_cuda_home_none("sparse_flash_attn_2")
     # Check, if CUDA11 is installed for compute capability 8.0
     cc_flag = []
     if CUDA_HOME is not None:
@@ -302,7 +302,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
 
     ext_modules.append(
         CUDAExtension(
-            name="flash_attn_2_cuda",
+            name="sparse_flash_attn_2_cuda",
             sources=[
                 "csrc/flash_attn/flash_api.cpp",
                 "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
@@ -440,7 +440,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
             generator_flag = ["-DOLD_GENERATOR_PATH"]
 
-        check_if_rocm_home_none("flash_attn")
+        check_if_rocm_home_none("sparse_flash_attn_2")
         cc_flag = [f"--offload-arch={arch}" for arch in kernel_targets]
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
@@ -525,7 +525,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         ext_modules.append(
             CUDAExtension(
-                name="flash_attn_2_cuda",
+                name="sparse_flash_attn_2_cuda",
                 sources=renamed_sources,
                 extra_compile_args=extra_compile_args,
                 include_dirs=include_dirs,
@@ -534,7 +534,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
 
 def get_package_version():
-    with open(Path(this_dir) / "flash_attn" / "__init__.py", "r") as f:
+    with open(Path(this_dir) / "sparse_flash_attn_2" / "__init__.py", "r") as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
     local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
@@ -664,8 +664,6 @@ setup(
             "docs",
             "benchmarks",
             "flash_attn.egg-info",
-            "flash_attn.cute",
-            "flash_attn.cute.*",
         )
     ),
     author="Tri Dao",

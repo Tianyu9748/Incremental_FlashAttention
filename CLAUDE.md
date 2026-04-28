@@ -1,136 +1,125 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## Project Overview
 
-FlashAttention-4 (FA4) — fast, memory-efficient exact attention kernels written in Python using CuTeDSL (NVIDIA CUTLASS DSL). Kernels are compiled to PTX/CUBIN at runtime. Targets Hopper (SM90) and Blackwell (SM100/SM110) GPUs. Package name: `flash-attn-4`.
+This repository contains two generations of FlashAttention CUDA kernels. Active work here targets **Hopper (SM90)**:
 
-The repository also contains older generations (FA2 in top-level `csrc/`, FA3 in `hopper/`) but active development is on FA4 in `flash_attn/cute/`.
+- **FA-2** (`csrc/flash_attn/`) — CUTLASS 2.x-based, C++/CUDA. Supports SM80 (Ampere) and SM90 (Hopper). Compiled ahead-of-time into per-(hdim, dtype, causal) `.cu` instantiations.
+- **FA-3** (`hopper/`) — CUTLASS 3.x-based, uses TMA + WGMMA + warp-specialization. Targets SM90 (Hopper) as the primary architecture.
 
-## Agent Scratch Space
-
-Use `agent_space/` for project-local scratch work such as lab notes, profiling outputs, temporary repro scripts, and experiment artifacts. Treat it as disposable workspace rather than product code.
+FA-4 (`flash_attn/cute/`) exists but is not the focus here.
 
 ## Build & Install
 
+**FA-2** (from repo root):
 ```bash
-pip install flash-attn-4
-# or dev install:
-pip install -e "flash_attn/cute[dev]"
+pip install flash-attn --no-build-isolation
+# or with parallelism:
+MAX_JOBS=4 pip install flash-attn --no-build-isolation
 ```
 
-Dependencies: `nvidia-cutlass-dsl>=4.4.1`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.2.10`.
+**FA-3** (from `hopper/`):
+```bash
+cd hopper && pip install . --no-build-isolation
+```
+
+Dependencies: `torch`, `ninja`, `packaging`, `psutil`, CUDA toolkit with `nvcc`.
 
 ## Running Tests
 
+**FA-2:**
 ```bash
-pytest tests/cute/test_flash_attn.py
-pytest tests/cute/test_flash_attn.py -k "test_flash_attn_output" -x  # single test
-pytest tests/cute/test_flash_attn_varlen.py
-pytest tests/cute/test_mask_mod.py
-pytest tests/cute/test_score_mod.py
-pytest tests/cute/test_block_sparsity.py
+pytest tests/test_flash_attn.py
+pytest tests/test_flash_attn.py -k "test_flash_attn_output" -x
 ```
 
-### Fast two-pass testing
-
-Compilation dominates test time. The fast workflow separates compilation (parallel, no GPU needed) from execution (uses cached binaries):
-
+**FA-3:**
 ```bash
-# Pass 1: compile all kernels in parallel using FakeTensorMode (no GPU memory allocation)
-FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -n 64 -x tests/cute/test_flash_attn.py
-
-# Pass 2: run tests using cached compiled kernels
-FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x tests/cute/test_flash_attn.py
+pytest hopper/test_flash_attn.py
+pytest hopper/test_flash_attn.py -k "test_flash_attn_output" -x
+pytest hopper/test_kvcache.py
 ```
 
-- `FLASH_ATTENTION_FAKE_TENSOR=1` — uses PyTorch FakeTensorMode to compile kernels without allocating GPU memory or running them.
-- `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` — enables persistent disk cache at `/tmp/${USER}/flash_attention_cute_dsl_cache/`.
-- `-n 256` — pytest-xdist parallel workers (only useful in the compilation pass).
-
-Tests are parametrized over dtype (fp16/bf16), head dimension (64, 96, 128), sequence length, causal/non-causal, and MHA/GQA/MQA.
-
-If you get OOM errors running tests or benchmarks, use `nvidia-smi` to find a free GPU and select it with `CUDA_VISIBLE_DEVICES=<id>`.
-
-## Linting
-
-Pre-commit uses ruff on `flash_attn/cute/` files. Large kernel files (`flash_bwd.py`, `flash_fwd.py`, `flash_fwd_sm100.py`, `interface.py`) are excluded from auto-formatting.
-
-```bash
-ruff check flash_attn/cute/ --fix
-ruff format flash_attn/cute/
-```
+If you get OOM errors, use `nvidia-smi` to find a free GPU and select it with `CUDA_VISIBLE_DEVICES=<id>`.
 
 ## Code Architecture
 
-### Public API (`flash_attn/cute/interface.py`)
+### FA-2 (`csrc/flash_attn/src/`)
 
-Two entry points exported from `flash_attn/cute/__init__.py`:
-- `flash_attn_func(q, k, v, ...)` — standard attention
-- `flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)` — variable-length
+| File | Role |
+|---|---|
+| `flash.h` | Core `Flash_params` struct (pointers, strides, dimensions) |
+| `kernel_traits.h` | `Flash_fwd_kernel_traits` / `Flash_bwd_kernel_traits`: tile shape (kBlockM/N), warp count, smem layout |
+| `flash_fwd_kernel.h` | Forward kernel: online softmax loop over K/V tiles |
+| `flash_bwd_kernel.h` | Backward kernel |
+| `flash_fwd_launch_template.h` | Grid/block launch logic for forward |
+| `flash_bwd_launch_template.h` | Grid/block launch logic for backward |
+| `flash_bwd_preprocess_kernel.h` | Backward preprocess (dO * O rowsum) |
+| `softmax.h` | Online softmax: `Softmax` struct with `scale_apply_exp2` |
+| `mask.h` | Causal and local/sliding-window masking |
+| `block_info.h` | `BlockInfo`: per-block M/N tile range accounting for padding and causal |
+| `utils.h` | Warp reductions, predicates, async copy helpers |
+| `flash_api.cpp` | Python binding entry point (pybind11) |
+| `src/flash_fwd_hdim*_*.cu` | Instantiation files — one per (hdim, dtype, causal) combination |
+| `src/flash_bwd_hdim*_*.cu` | Backward instantiation files |
+| `src/generate_kernels.py` | Script that regenerates the `.cu` instantiation files |
 
-Key parameters: `causal`, `window_size_left/right`, `softmax_scale`, `softcap`, `score_mod`, `mask_mod`, `block_sparse_tensors`, `num_splits`, `pack_gqa`, `m_block_size`, `n_block_size`, `num_threads`.
+**Key pattern:** Tile config is baked into `kernel_traits.h` via template parameters. To add a new tile shape or head dim, add entries in `generate_kernels.py` and re-run it, then rebuild.
 
-Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-byte aligned.
+### FA-3 (`hopper/`)
 
-### Forward Kernels
+| File | Role |
+|---|---|
+| `flash.h` | Core `Flash_params` / `Flash_fwd_params` / `Flash_bwd_params` structs |
+| `flash_fwd_kernel_sm90.h` | SM90 forward kernel entry (warp-specialized: producer/consumer warps) |
+| `flash_bwd_kernel_sm90.h` | SM90 backward kernel entry |
+| `flash_fwd_kernel_sm80.h` | SM80 fallback forward kernel |
+| `flash_bwd_kernel_sm80.h` | SM80 fallback backward kernel |
+| `mainloop_fwd_sm90_tma_gmma_ws.hpp` | **Core FA-3 Hopper forward**: `CollectiveMainloopFwdSm90` — TMA loads (K, V, Q), WGMMA, pipelined K/V stages |
+| `mainloop_bwd_sm90_tma_gmma_ws.hpp` | **Core FA-3 Hopper backward**: `CollectiveMainloopBwdSm90` |
+| `mainloop_fwd_sm80.hpp` | Ampere fallback forward mainloop |
+| `mainloop_bwd_sm80.hpp` | Ampere fallback backward mainloop |
+| `epilogue_fwd.hpp` | Forward epilogue: write O and LSE to global memory |
+| `epilogue_bwd.hpp` | Backward epilogue: write dQ, dK, dV |
+| `softmax.h` | Online softmax with running max/sum |
+| `mask.h` | Causal, local window, and custom mask support |
+| `seqlen.h` | Variable-length sequence bookkeeping |
+| `block.h` | Block/tile offset and range computation |
+| `paged_kv.h` | Paged KV cache support |
+| `pack_gqa.h` | GQA head packing |
+| `tile_scheduler.hpp` | Tile scheduling (static and varlen-aware) |
+| `named_barrier.hpp` | Named barrier enums for warp-group synchronization |
+| `sm90_pipeline_no_cluster.hpp` | Custom pipeline state for non-cluster TMA |
+| `flash_fwd_launch_template.h` | Forward launch: selects SM90 vs SM80 path, sets grid/block |
+| `flash_bwd_launch_template.h` | Backward launch template |
+| `flash_fwd_combine.cu` | SplitKV partial-result combine kernel |
+| `flash_api.cpp` | Python binding entry point |
+| `flash_attn_interface.py` | Python API: `flash_attn_func`, `flash_attn_varlen_func`, `flash_attn_with_kvcache` |
+| `instantiations/` | Per-(hdim, dtype, causal) `.cu` instantiation files |
+| `generate_kernels.py` | Regenerates `instantiations/` |
 
-- `flash_fwd.py` — `FlashAttentionForwardSm90`: Hopper forward. No SplitKV or paged KV.
-- `flash_fwd_sm100.py` — `FlashAttentionForwardSm100`: Blackwell forward. Full features including SplitKV, paged KV cache, persistent kernels, 2CTA instructions.
-- `flash_fwd_combine.py` — `FlashAttentionForwardCombine`: merges SplitKV partial results.
+**Key pattern:** FA-3 uses warp-specialization — producer warps issue TMA loads while consumer warp-groups run WGMMA. The pipeline in `mainloop_fwd_sm90_tma_gmma_ws.hpp` coordinates them via `MainloopPipelineK` / `MainloopPipelineV` (CUTLASS `PipelineTmaAsync`). To change pipeline depth, modify the `Stages` template parameter.
 
-### Backward Kernels
+## Key Differences FA-2 vs FA-3
 
-- `flash_bwd.py` — `FlashAttentionBackwardSm80`: Ampere backward (base).
-- `flash_bwd_sm90.py` — `FlashAttentionBackwardSm90`: Hopper backward.
-- `flash_bwd_sm100.py` — `FlashAttentionBackwardSm100`: Blackwell backward with 2CTA and block sparse support.
-- `flash_bwd_preprocess.py` / `flash_bwd_postprocess.py` — auxiliary backward kernels.
-
-### Core Abstractions
-
-- `softmax.py` — Online softmax with row_max/row_sum tracking, score modifier support.
-- `mask.py` — `AttentionMask`: causal, local/sliding window, block sparse, mask_mod application.
-- `block_info.py` — `BlockInfo`: tile dimensions, n/m block range computation for causal/local masking.
-- `seqlen_info.py` — `SeqlenInfoQK`: sequence length and offset tracking for varlen.
-- `pipeline.py` — `PipelineStateSimple`: circular buffer index/phase management for pipelined loads.
-- `tile_scheduler.py` — Tile scheduling strategies (single tile, varlen-aware, persistent).
-- `copy_utils.py` — Type-converting copies, shared-to-register loads, TMA copy atoms.
-- `named_barrier.py` — Named barrier enums for warp synchronization.
-
-### Architecture-Specific Helpers
-
-- `hopper_helpers.py` — SM90 warp-group GEMM, shared memory layout creation, fence/commit/wait.
-- `blackwell_helpers.py` — SM100 UMMA-based GEMM, PTX-optimized paths, 2CTA support.
-- `mma_sm100_desc.py` — Hardware MMA descriptor enums (formats, saturation, scaling).
-
-### Other Components
-
-- `pack_gqa.py` — Packs multiple Q heads per KV head for efficient GQA.
-- `paged_kv.py` — `PagedKVManager`: paged KV cache with TMA support.
-- `fast_math.py` — exp2 polynomial coefficients, softcap score_mod creation.
-- `utils.py` — Hash functions for compile cache keys, warp reductions, predicates.
-- `cache_utils.py` — JIT compilation cache management.
-- `cute_dsl_utils.py` — Patched `cute.compile` that optionally dumps SASS.
-
-### Compilation & Caching
-
-Kernels are JIT-compiled. Cache key includes dtype, head_dim, causal, mask/score_mod hashes, architecture, block sizes. Caching levels: in-memory LRU + optional disk cache via `get_jit_cache()`.
-
-Env vars: `CUTE_CUBIN_PATH` (dump CUBIN/SASS), `CUTE_DSL_KEEP_PTX=1` (inspect PTX), `CUTE_DSL_PTXAS_PATH` (custom ptxas).
-
-## Key Patterns
-
-- Compile-time constants use `cutlass.Constexpr[type]` for kernel specialization.
-- Score/mask modifiers are user-defined `@cute.jit` callables injected into the kernel at compile time.
-- Forward execution: load Q tile → loop over K/V blocks (pipelined) → online softmax accumulation → store O and LSE.
-- 2CTA instructions (SM100, hdim=128): both CTAs in a cluster coordinate via shared mbarriers; tx_count must be multiplied by `cta_group_size`.
+| | FA-2 | FA-3 |
+|---|---|---|
+| Location | `csrc/flash_attn/` | `hopper/` |
+| CUTLASS version | 2.x (`csrc/cutlass/`) | 3.x (system or bundled) |
+| SM90 strategy | Standard CUDA threads | TMA + WGMMA + warp-specialization |
+| Async copy | `cp.async` | TMA (`tma_load_K/V/Q`) |
+| MMA | `mma.sync` (HMMA) | `wgmma.mma_async` |
+| Pipeline | Manual smem double-buffering | CUTLASS `PipelineTmaAsync` |
+| Instantiation | Per-`.cu` files in `src/` | Per-`.cu` files in `instantiations/` |
 
 ## Debugging GPU Kernels
 
-See `AI/DEBUG_2CTA.md` for kernel hang/deadlock debugging (printf bisection, pipeline barrier analysis, 2CTA pitfalls). See `AI/RACECHECK_TMA_HAZARD.md` for `compute-sanitizer` false positives with `cp.async.bulk`. See `AI/CLC_TRACE_DEBUG.md` for visualization of CLC scheduling.
-
-Key tools:
-- `cute.printf` with thread guards (`tidx % 32 == 0`, `elect_one()`) for targeted output
-- `compute-sanitizer --tool=racecheck` (beware false positives with raw TMA)
-- `CUTE_DSL_KEEP_PTX=1` and `CUTE_DSL_LINEINFO=1` for PTX inspection and sanitizer source mapping
+- Use `printf` with thread guards to avoid flooding output:
+  ```cpp
+  if (threadIdx.x % 32 == 0 && blockIdx.x == 0) { printf(...); }
+  ```
+- `compute-sanitizer --tool=racecheck` — note: false positives with raw TMA (`cp.async.bulk`)
+- `CUTE_DSL_KEEP_PTX=1` / `CUTE_DSL_LINEINFO=1` — for PTX inspection (FA-4, less relevant here)
+- For FA-3 pipeline deadlocks: bisect with `printf` at `producer_acquire` / `consumer_wait` / `consumer_release` callsites to isolate which stage hangs

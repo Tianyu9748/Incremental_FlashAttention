@@ -59,6 +59,9 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
+    // Exposed for the sparse-path dispatch in flash_fwd_kernel_sm90.h
+    // (the template parameter name is shadowed inside the class body).
+    static constexpr bool IsIntraWGOverlap = IntraWGOverlap;
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
@@ -396,6 +399,12 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        // Speculative sparse attention (plan.md Phase 2). When non-null, the
+        // mainloop iterates only the listed K/V block indices and skips
+        // causal / local masking. Mutually exclusive with ptr_pagetable and
+        // AppendKV.
+        int const* const ptr_sparse_block_table = nullptr;
+        int const sparse_num_blocks = 0;
     };
 
     // Device side kernel params
@@ -453,6 +462,9 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
+        // Speculative sparse attention (plan.md Phase 2). See Arguments.
+        int const* const ptr_sparse_block_table = nullptr;
+        int const sparse_num_blocks = 0;
     };
 
     static Params
@@ -564,7 +576,8 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.ptr_sparse_block_table, args.sparse_num_blocks};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -909,6 +922,162 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_v.producer_tail(smem_pipe_write);
             if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
         }
+    }
+
+    // Speculative sparse attention (plan.md Phase 2). Sibling to `load`.
+    // Same signature as `load`; see that method for the dense baseline.
+    // The sparse path iterates only the blocks listed in
+    // params.ptr_sparse_block_table[0 .. sparse_num_blocks), assumes every
+    // entry is a fully-historical block (no seqlen-k boundary masking
+    // needed), and is mutually exclusive with paged KV / AppendKV.
+    //
+    // Supported template variants (see kernel-entry dispatch):
+    //   IntraWGOverlap=true, !AppendKV, !PagedKVNonTMA, !HasQv,
+    //   !Transpose_V, !LargeHeadDimV.
+    // For any other variant the kernel entry does not dispatch here.
+    template <typename SchedulerPrefetch, typename SharedStorage>
+    CUTLASS_DEVICE void
+    load_sparse(Params const& params,
+                MainloopPipelineK pipeline_k,
+                MainloopPipelineV pipeline_v,
+                MainloopPipelineVt /*pipeline_vt*/,  // unused: sparse requires !Transpose_V
+                PipelineState& smem_pipe_write,
+                SharedStorage &shared_storage,
+                SchedulerPrefetch const& scheduler_prefetch,
+                SeqlenInfo_t const& seqlen_info,
+                cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+                int &work_idx
+                ) {
+        static_assert(!AppendKV, "sparse path does not support AppendKV");
+        static_assert(!PagedKVNonTMA, "sparse path does not support PagedKVNonTMA");
+        static_assert(!HasQv, "sparse path does not support HasQv");
+        static_assert(!Transpose_V, "sparse path does not support Transpose_V");
+        static_assert(!LargeHeadDimV, "sparse path does not support LargeHeadDimV");
+        static_assert(IntraWGOverlap, "sparse path requires IntraWGOverlap");
+
+        int const m_block = get<0>(block_coord);
+        int const bidh = get<1>(block_coord);
+        int const bidb = get<2>(block_coord);
+
+        const int num_blocks = params.sparse_num_blocks;
+        if (num_blocks <= 0) {
+            scheduler_prefetch();
+            return;
+        }
+
+        Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
+        Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+        Tensor sVt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
+
+        int const thread_idx = threadIdx.x % NumProducerThreads;
+        int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
+        int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
+
+        uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+        constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
+        uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
+
+        bool const is_varlen_q = Varlen && params.cu_seqlens_q;
+        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
+        auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
+        Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
+
+        Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ),
+                               select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
+        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}, _0{}), mK_TMA),
+                                   select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));
+        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k, _0{}), mVt_TMA),
+                                    select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));
+
+        auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
+        Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));
+        Tensor tQsQ = group_modes<0, 3>(block_tma_Q.partition_D(sQ));
+        if (Use_TMA_Q && thread_idx == 0) { prefetch(params.tma_load_Q, tQgQ); }
+        auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
+        Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));
+        Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K.partition_D(sK));
+        auto block_tma_V = params.tma_load_V.get_slice(cluster_local_block_id.x);
+        Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));
+        Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V.partition_D(sVt));
+
+        // For non-paged (sparse is mutually exclusive with paged KV) and
+        // non-varlen, batch index is bidb_kv; for varlen the K/V gmem tensor
+        // is flat so batch index is 0.
+        int const bidb_kv_idx = !is_varlen_k ? bidb_kv : 0;
+
+        uint16_t mcast_mask_kv = 0;
+        if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
+            auto block_layout = Layout<ClusterShape>{};
+            for (int m = 0; m < size<0>(block_layout); ++m) {
+                mcast_mask_kv |= (uint16_t(1) << block_layout(m, cluster_local_block_id.y, _0{}));
+            }
+        }
+
+        auto load_K = [&] (int const n_block, auto const& smem_pipe_write_arg) {
+            pipeline_k.producer_acquire(smem_pipe_write_arg);
+            copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_arg), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
+                 tKgK_TMA(_, n_block, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write_arg.index()));
+        };
+        auto load_V = [&] (int const n_block, auto const& smem_pipe_write_arg) {
+            pipeline_v.producer_acquire(smem_pipe_write_arg);
+            copy(params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_arg), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
+                 tVgVt_TMA(_, n_block, bidb_kv_idx), tVsVt_TMA(_, smem_pipe_write_arg.index()));
+        };
+
+        int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
+        static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
+        bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
+
+        // First K load (IntraWGOverlap: V lags K by one stage, so V for
+        // sparse_block_table[0] is loaded AFTER the main loop as a trailing
+        // load_V on the current smem_pipe_write).
+        int n_block = params.ptr_sparse_block_table[0];
+        if (should_load_KV) { load_K(n_block, smem_pipe_write); }
+
+        if constexpr (Use_TMA_Q) {
+            if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
+                cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
+            }
+            if ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()) {
+                shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
+                copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
+                    tQgQ, tQsQ);
+            }
+        } else {  // cp.async Q
+            cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
+            Tensor mQ_cpasync = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+            Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+            using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element>;
+            PackGQAt::load_Q(mQ_cpasync, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
+            auto &barrier_Q_cp = shared_storage.pipelines.barrier_Q;
+            cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q_cp));
+            barrier_Q_cp.arrive();
+        }
+
+        // Wait for the MMA warpgroups to signal that smem_v is ready.
+        shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+
+        // Main loop: for i in [1, num_blocks), load K for block i and V for
+        // block i-1 on the previous pipe index.
+        int n_block_prev = n_block;
+        #pragma unroll 1
+        for (int i = 1; i < num_blocks; ++i) {
+            n_block = params.ptr_sparse_block_table[i];
+            PipelineState smem_pipe_write_v = smem_pipe_write;  // V is one stage behind
+            ++smem_pipe_write;
+            if (should_load_KV) {
+                load_K(n_block, smem_pipe_write);
+                load_V(n_block_prev, smem_pipe_write_v);
+            }
+            n_block_prev = n_block;
+        }
+        scheduler_prefetch();
+        // Trailing V for the final K block.
+        if (should_load_KV) { load_V(n_block_prev, smem_pipe_write); }
+        ++smem_pipe_write;
+        ++work_idx;
     }
 
     CUTLASS_DEVICE void
@@ -1347,6 +1516,195 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
         }
+        ++work_idx;
+        return true;
+    }
+
+    // Speculative sparse attention consumer (plan.md Phase 2). Sibling to
+    // `mma`. Matches the IntraWGOverlap path of `mma` one-for-one but:
+    //   - iterates params.ptr_sparse_block_table[0 .. sparse_num_blocks)
+    //     instead of the dense [n_block_min, n_block_max) range,
+    //   - applies NO causal / local / seqlen-k mask (caller contract),
+    //   - uses Check_inf=false because no row can be fully masked.
+    // Supported variants: same as load_sparse (IntraWGOverlap=true,
+    // !AppendKV, !PagedKVNonTMA, !HasQv, !Transpose_V, !LargeHeadDimV).
+    template <typename SharedStorage, typename FrgTensorO, typename Softmax>
+    CUTLASS_DEVICE bool
+    mma_sparse(Params const& params,
+               MainloopPipelineK pipeline_k,
+               MainloopPipelineV pipeline_v,
+               PipelineState& smem_pipe_read,
+               FrgTensorO& tOrO,
+               Softmax& softmax,
+               int const thread_idx,
+               int &work_idx,
+               SeqlenInfo_t const& seqlen_info,
+               cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+               SharedStorage& shared_storage
+               ) {
+        static_assert(!AppendKV, "sparse path does not support AppendKV");
+        static_assert(!PagedKVNonTMA, "sparse path does not support PagedKVNonTMA");
+        static_assert(!HasQv, "sparse path does not support HasQv");
+        static_assert(!Transpose_V, "sparse path does not support Transpose_V");
+        static_assert(!LargeHeadDimV, "sparse path does not support LargeHeadDimV");
+        static_assert(IntraWGOverlap, "sparse path requires IntraWGOverlap");
+        static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
+
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+
+        int const m_block = get<0>(block_coord);
+        int const bidh = get<1>(block_coord);
+        int const bidb = get<2>(block_coord);
+        int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
+
+        const int num_blocks = params.sparse_num_blocks;
+        if (num_blocks <= 0) { return false; }  // epilogue store_zero writes O=0, LSE=-inf
+
+        Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
+        Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+        Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
+        Tensor sP = [&] {
+            if constexpr (MmaPV_is_RS) {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutP{});
+            } else {
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_p.data()), SmemLayoutP{});
+            }
+        }();
+
+        if constexpr (!MmaQK_is_RS) {
+            static_assert(stride<0>(typename TiledMmaQK::ALayout{}) == 0 and
+                        stride<0>(typename TiledMmaQK::BLayout{}) == 0 and
+                        size<0>(typename TiledMmaQK::ALayout{}) == cutlass::NumThreadsPerWarpGroup and
+                        size<0>(typename TiledMmaQK::BLayout{}) == cutlass::NumThreadsPerWarpGroup,
+                "Stride of the first mode must be 0 and the size of the mode must be NumThreadsPerWarpGroup");
+        }
+        static constexpr int MmaWarpGroups = size(TiledMmaPV{}) / cutlass::NumThreadsPerWarpGroup;
+        Layout warp_group_thread_layout = make_layout(make_shape(Int<MmaWarpGroups>{}),
+                                                      make_stride(Int<cutlass::NumThreadsPerWarpGroup>{}));
+
+        int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
+        TiledMmaQK tiled_mma_qk;
+        TiledMmaPV tiled_mma_pv;
+        auto wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx));
+        auto wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx));
+
+        auto smem_tiled_copy_P = make_tiled_copy_C(SmemCopyAtomP{}, tiled_mma_qk);
+        auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(thread_idx);
+
+        Tensor tSrQ = wg_mma_qk.partition_fragment_A(sQ);
+        Tensor tSrK = wg_mma_qk.partition_fragment_B(sK);
+        Tensor tOrV = wg_mma_pv.partition_fragment_B(sV);
+        Tensor tOsP = wg_mma_pv.partition_fragment_A(sP);
+        Tensor tPsP = smem_thr_copy_P.partition_D(cute::as_position_independent_swizzle_tensor(sP));
+
+        auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read_arg) {
+            auto barrier_token = pipeline.consumer_try_wait(smem_pipe_read_arg);
+            pipeline.consumer_wait(smem_pipe_read_arg, barrier_token);
+        };
+
+        float softcap_val = params.softcap_val;
+        if constexpr (Has_softcap && Is_FP8) {
+            float const q_descale = params.ptr_q_descale == nullptr ? 1.0f : params.ptr_q_descale[bidb * get<0>(params.stride_q_descale) + bidh_kv * get<1>(params.stride_q_descale)];
+            float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
+            softcap_val *= q_descale * k_descale;
+        }
+        auto scoremod_premask_fn = [&](auto& tSrS) {
+            if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+        };
+
+        auto write_P_to_smem = [&](auto& tOrP) {
+            cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
+        };
+        auto arrive_on_P_write_barrier = [&] {
+            cutlass::arch::fence_view_async_shared();
+            __syncwarp();
+        };
+
+        auto &barrier_Q = shared_storage.pipelines.barrier_Q;
+        barrier_Q.wait(work_idx % 2);  // !AppendKV path
+
+        if constexpr (MmaQK_is_RS) {
+            using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
+            auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma_qk);
+            auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(thread_idx);
+            Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+            Tensor tSsQ_copy_view = smem_thr_copy_Q.partition_S(cute::as_position_independent_swizzle_tensor(sQ));
+            cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
+        }
+
+        // Prologue: GEMM Q @ K for sparse_block_table[0]; softmax init;
+        // P conversion + write to smem.
+        Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+        consumer_wait(pipeline_k, smem_pipe_read);
+        flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+        warpgroup_wait<0>();
+        pipeline_k.consumer_release(smem_pipe_read);
+        scoremod_premask_fn(tSrS);
+        // NO mask.apply — sparse blocks are fully-historical by contract.
+
+        Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/false>(tSrS);
+        softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/false>(tSrS);
+        if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
+        Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
+        Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+        convert_type_out(tOrP_acc, tOrP);
+        if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+        if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
+        if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
+
+        // Initialize tOrO (RescaleOBeforeGemm scales it even in iter 1).
+        clear(tOrO);
+
+        // fwd_step: one iteration of the IntraWGOverlap loop; mirrors the
+        // dense fwd_step exactly except mask_fn is a no-op.
+        auto fwd_step = [&] {
+            PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
+            ++smem_pipe_read;
+            Tensor tSrS_inner = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+            if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
+            warp_scheduler_barrier_sync();
+            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS_inner);
+            if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
+            if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
+            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+            warp_scheduler_barrier_arrive();
+            warpgroup_wait<1>();
+            pipeline_k.consumer_release(smem_pipe_read);  // release K
+            scoremod_premask_fn(tSrS_inner);
+            // NO mask.apply
+            cute::copy(softmax.template max_get_scale</*Is_first=*/false, /*Check_inf=*/false>(tSrS_inner), scores_scale);
+            softmax.template online_softmax</*Is_first=*/false, /*Check_inf=*/false>(tSrS_inner);
+            warpgroup_wait<0>();
+            pipeline_v.consumer_release(smem_pipe_read_v);  // release V
+            if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS_inner); }
+            convert_type_out(make_tensor(tSrS_inner.data(), tOrP.layout()), tOrP);
+            if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+            if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
+            if constexpr (!RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
+            if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
+        };
+
+        // Main loop over the remaining sparse blocks.
+        #pragma unroll 1
+        for (int i = 1; i < num_blocks; ++i) {
+            fwd_step();
+        }
+
+        // Tell producers that smem_q is ready for the next tile.
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
+
+        // Epilogue: final P @ V for the last sparse block.
+        if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
+        consumer_wait(pipeline_v, smem_pipe_read);
+        flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+        float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
+        cute::copy(softmax.finalize(v_descale), scores_scale);
+        warpgroup_wait<0>();
+        pipeline_v.consumer_release(smem_pipe_read);
+        softmax.rescale_o(tOrO, scores_scale);
+        if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
+        ++smem_pipe_read;
         ++work_idx;
         return true;
     }
