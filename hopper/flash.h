@@ -133,6 +133,11 @@ struct Flash_fwd_params : public Qkv_params {
     // callers must set at most one.
     int * __restrict__ sparse_block_table;
     int sparse_num_blocks;
+    // User-visible block granularity in tokens. Defaults to 128 (the
+    // historical sparse block size, matching the compile-time kBlockN).
+    // Target 2 lets callers pass {16, 32, 64, 128, 256}; non-128 values
+    // route to the sparse-only kernels generated with that kBlockN.
+    int sparse_block_size;
 
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
@@ -227,6 +232,12 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+// Target 2 (Option A): sparse-only entry with kBlockN as a template arg.
+// Defined in flash_fwd_launch_template.h; instantiated by
+// instantiations/flash_fwd_sparse_*.cu.
+template <int Arch, typename T, int kHeadDim, int kHeadDimV, int kBlockN_sparse,
+          bool Split, bool Has_softcap, bool PackGQA>
+void run_mha_fwd_sparse_(Flash_fwd_params &params, cudaStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);

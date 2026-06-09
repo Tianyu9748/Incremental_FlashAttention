@@ -567,6 +567,16 @@ if not SKIP_CUDA_BUILD:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                             for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF192_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
                             if not (packgqa and (paged or split))]
+    # Target 2 (Option A): sparse-only kernels with kBlockN ∈ {16, 32, 64, 256}.
+    # Hdim=128 only (initial scope); fp16+bf16; both Split values. The 128
+    # kBlockN case is served by the regular sources above.
+    SPARSE_KBLOCKN = [16, 32, 64, 256]
+    SPARSE_DTYPE_FWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
+    if not DISABLE_HDIM128:
+        sources_fwd_sm90 += [
+            f"instantiations/flash_fwd_sparse_hdim128_blockn{kn}_{dtype}{split}_sm90.cu"
+            for kn, dtype, split in itertools.product(SPARSE_KBLOCKN, SPARSE_DTYPE_FWD, SPLIT)
+        ]
     sources_bwd_sm80 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm80.cu"
                         for hdim, dtype, softcap in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD, SOFTCAP)]
     sources_bwd_sm90 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm90.cu"

@@ -35,10 +35,28 @@ SPLIT = [False, True]
 SOFTCAP = [False, True]
 PACKGQA = [False, True]
 
+# Target 2 (Option A): sparse-only kernel variants with kBlockN ∈ {16, 32, 64, 256}.
+# kBlockN = 128 reuses the regular fwd instantiations (no separate file).
+# Initial scope: hdim=128 only, fp16/bf16 only, both Split values.
+SPARSE_KBLOCKN = [16, 32, 64, 256]
+SPARSE_HEAD_DIMENSIONS = [128]
+SPARSE_DTYPES_FWD = ["bf16", "fp16"]
+SPARSE_SPLIT = [False, True]
+
 KERNEL_IMPL_TEMPLATE_FWD_SM90 = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
+"""
+
+# Target 2: sparse-only entry with kBlockN as an explicit template arg.
+# PackGQA is always true and softcap always false here (the dispatch in
+# flash_api.cpp's run_mha_fwd hard-codes those choices).
+KERNEL_IMPL_TEMPLATE_FWD_SM90_SPARSE = """#include "flash_fwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
+template void run_mha_fwd_sparse_<90, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {KBLOCKN}, {SPLIT}, false /*Has_softcap*/, true /*PackGQA*/>(Flash_fwd_params &params, cudaStream_t stream);
 #endif
 """
 
@@ -91,9 +109,19 @@ class Kernel:
     softcap: bool
     packgqa: bool
     direction: str
+    # Target 2: when set, emit a sparse-only instantiation with this kBlockN.
+    # None → emit the standard run_mha_fwd_<...> template.
+    sparse_kblockn: Optional[int] = None
 
     @property
     def template(self) -> str:
+        if self.direction == "fwd" and self.sparse_kblockn is not None:
+            return KERNEL_IMPL_TEMPLATE_FWD_SM90_SPARSE.format(
+                DTYPE=DTYPE_MAP[self.dtype],
+                HEAD_DIM=self.head_dim, HEAD_DIM_V=self.head_dim_v,
+                KBLOCKN=self.sparse_kblockn,
+                SPLIT=str(self.split).lower(),
+            )
         if self.direction == "fwd":
             if self.sm == 90:
                 # Always enable PackGQA for PagedKV or Split to reduce compilation
@@ -125,6 +153,12 @@ class Kernel:
 
     @property
     def filename(self) -> str:
+        if self.sparse_kblockn is not None:
+            return (
+                f"flash_fwd_sparse_hdim{self.head_dim}"
+                f"_blockn{self.sparse_kblockn}_{self.dtype}"
+                f"{'_split' if self.split else ''}_sm90.cu"
+            )
         return f"flash_{self.direction}_hdim{self.head_dim}{f'_{self.head_dim_v}' if self.head_dim_v != self.head_dim else ''}_{self.dtype}{'_paged' if self.paged_kv else ''}{'_split' if self.split else ''}{'_softcap' if self.softcap else ''}{'_packgqa' if self.packgqa else ''}_sm{self.sm}.cu"
 
 
@@ -143,9 +177,23 @@ def get_all_kernels() -> List[Kernel]:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
     for dtype, head_dim, softcap, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SOFTCAP, SM):
         yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=False, paged_kv=False, softcap=softcap, packgqa=False, direction="bwd")
+    # Target 2: sparse-only kernels with explicit kBlockN ∈ {16, 32, 64, 256}.
+    # Always SM90, never paged, packgqa fixed to True in the instantiation
+    # template, softcap fixed to False. Only dtype × hdim × split × kBlockN vary.
+    for dtype, head_dim, split, kblockn in itertools.product(
+        SPARSE_DTYPES_FWD, SPARSE_HEAD_DIMENSIONS, SPARSE_SPLIT, SPARSE_KBLOCKN
+    ):
+        yield Kernel(
+            sm=90, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim,
+            split=split, paged_kv=False, softcap=False, packgqa=True,
+            direction="fwd", sparse_kblockn=kblockn,
+        )
 
 
 def batch_hdim(kernels_all) -> List[KERNEL_BATCH]:
+    # Exclude Target 2 sparse-only kernels from the hdim-aggregated builds;
+    # they ship as standalone .cu files keyed on kBlockN.
+    kernels_all = [k for k in kernels_all if k.sparse_kblockn is None]
     for dtype, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
         if sm < 90:
             continue
@@ -164,6 +212,9 @@ def batch_hdim(kernels_all) -> List[KERNEL_BATCH]:
 
 
 def batch_softcap(kernels_all) -> List[KERNEL_BATCH]:
+    # Target 2 sparse-only kernels are softcap=False by construction; keep
+    # them out of the softcap-aggregated builds.
+    kernels_all = [k for k in kernels_all if k.sparse_kblockn is None]
     for dtype, head_dim, split, paged_kv, packgqa, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, PACKGQA, SM):
         if sm >= 90:
             continue

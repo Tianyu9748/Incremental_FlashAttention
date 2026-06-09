@@ -180,6 +180,28 @@
     }                                                                                            \
   }()
 
+// Sparse path block size dispatch (Target 2 Option A). The 128 case
+// short-circuits to the regular kernel before this macro is reached, so
+// only the non-default sizes {16, 32, 64, 256} need branches here. The
+// caller (flash_api.cpp) validates block_size before reaching this macro;
+// matches the pattern of HEADDIM_SWITCH (no fall-through clause).
+#define SPARSE_BLOCK_N_SWITCH(BLOCK_SIZE, CONST_NAME, ...)                                       \
+  [&] {                                                                                          \
+    if (BLOCK_SIZE == 16) {                                                                      \
+      constexpr static int CONST_NAME = 16;                                                      \
+      return __VA_ARGS__();                                                                      \
+    } else if (BLOCK_SIZE == 32) {                                                               \
+      constexpr static int CONST_NAME = 32;                                                      \
+      return __VA_ARGS__();                                                                      \
+    } else if (BLOCK_SIZE == 64) {                                                               \
+      constexpr static int CONST_NAME = 64;                                                      \
+      return __VA_ARGS__();                                                                      \
+    } else if (BLOCK_SIZE == 256) {                                                              \
+      constexpr static int CONST_NAME = 256;                                                     \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+  }()
+
 #define NUM_WARP_SWITCH(VALUE, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     if (VALUE <= 1) {                                                                            \

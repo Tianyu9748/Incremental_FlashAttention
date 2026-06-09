@@ -140,6 +140,7 @@ def _flash_attn_forward(
         pack_gqa,
         sm_margin,
         None,  # sparse_block_table (plan.md) — not exposed via the custom_op path
+        128,   # sparse_block_size — unused when sparse_block_table is None
     )
 
     if out_accum is None:
@@ -947,6 +948,7 @@ def flash_attn_with_sparse_block_table(
     sparse_block_table,
     softmax_scale=None,
     sm_margin=0,
+    block_size=128,
 ):
     """Phase-2 sparse missed-block pass (plan.md).
 
@@ -960,19 +962,28 @@ def flash_attn_with_sparse_block_table(
     Args:
         q: (batch, seqlen_q, nheads, head_size)
         k: (batch, seqlen_k, nheads_k, head_size) — seqlen_k must be a
-            multiple of the kernel's kBlockN.
+            multiple of `block_size`.
         v: (batch, seqlen_k, nheads_k, head_size_v)
         sparse_block_table: (num_sparse_blocks,) int32 CUDA tensor. Block
-            indices into k/v along the seqlen dimension. If empty the call
-            returns O=0, LSE=-inf (empty partial for combine).
+            indices into k/v along the seqlen dimension. Each entry covers
+            a `block_size`-token slice (physical offset = block_idx *
+            block_size). If empty the call returns O=0, LSE=-inf (empty
+            partial for combine).
         softmax_scale: defaults to 1/sqrt(head_size).
         sm_margin: passthrough to the kernel launch.
+        block_size: token granularity of each sparse_block_table entry.
+            One of {16, 32, 64, 128, 256}. Default 128 reuses the standard
+            kernel; other values route to a sparse-only variant compiled
+            with kBlockN = block_size (currently hdim=128 only).
 
     Returns:
         out: (batch, seqlen_q, nheads, head_size_v)
         softmax_lse: (batch, nheads, seqlen_q)
     """
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+    assert block_size in (16, 32, 64, 128, 256), (
+        f"block_size must be one of {{16, 32, 64, 128, 256}}, got {block_size}"
+    )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     sparse_block_table = maybe_contiguous(sparse_block_table)
@@ -995,11 +1006,149 @@ def flash_attn_with_sparse_block_table(
         0.0,                             # softcap
         False,                           # is_rotary_interleaved
         None,                            # scheduler_metadata
-        1,                               # num_splits — sparse path is non-splitkv
+        0,                               # num_splits — 0 lets C++ get_num_splits pick
         None,                            # pack_gqa
         sm_margin,
         sparse_block_table,
+        block_size,                      # sparse_block_size — granularity of the table entries
     )
+    return out, softmax_lse
+
+
+def flash_attn_with_sparse_block_table_partials(
+    q,
+    k,
+    v,
+    sparse_block_table,
+    softmax_scale=None,
+    sm_margin=0,
+    block_size=128,
+):
+    """Sparse FA-3 forward returning per-block partial outputs.
+
+    Like `flash_attn_with_sparse_block_table`, but does not merge the
+    per-block softmax results. Each entry of `sparse_block_table` gets
+    its own (o_b, lse_b) so the caller can later select a subset of
+    blocks and combine them via `flash_attn_combine`. Designed for the
+    speculative + repair pattern: the speculative pass over P emits
+    per-block partials, and once the true top-K set A is known the
+    caller merges the P ∩ A subset with freshly computed A \\ P
+    partials.
+
+    Implemented by forcing `num_splits = len(sparse_block_table)` so the
+    split-K wiring (Target 1) makes every split own exactly one block.
+    The in-kernel combine still runs but its outputs are discarded; the
+    cost is negligible at the |P| sizes this function is intended for.
+
+    Args:
+        q: (batch, seqlen_q, nheads, head_size)
+        k: (batch, seqlen_k, nheads_k, head_size) — seqlen_k must be a
+            multiple of `block_size`.
+        v: (batch, seqlen_k, nheads_k, head_size_v)
+        sparse_block_table: (num_blocks,) int32 CUDA tensor, same
+            semantics as in `flash_attn_with_sparse_block_table`. Must
+            be non-empty.
+        softmax_scale: defaults to 1/sqrt(head_size).
+        sm_margin: passthrough to the kernel launch.
+        block_size: one of {16, 32, 64, 128, 256}.
+
+    Returns:
+        o_partial:   (num_blocks, batch, nheads, seqlen_q, head_size_v) fp32
+        lse_partial: (num_blocks, batch, nheads, seqlen_q)              fp32
+    """
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+    assert block_size in (16, 32, 64, 128, 256), (
+        f"block_size must be one of {{16, 32, 64, 128, 256}}, got {block_size}"
+    )
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    sparse_block_table = maybe_contiguous(sparse_block_table)
+    assert (
+        sparse_block_table is not None
+        and sparse_block_table.dtype == torch.int32
+        and sparse_block_table.dim() == 1
+        and sparse_block_table.numel() > 0
+    ), "sparse_block_table must be a non-empty 1D int32 CUDA tensor"
+    num_blocks = int(sparse_block_table.numel())
+    _, _, o_partial, lse_partial = flash_attn_3_gpu.fwd(
+        q, k, v,
+        None, None, None, None,          # k_new, v_new, qv, out
+        None, None, None,                # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
+        None, None,                      # seqused_q, seqused_k
+        None, None,                      # max_seqlen_q, max_seqlen_k
+        None,                            # page_table
+        None, None,                      # kv_batch_idx, leftpad_k
+        None, None, None,                # rotary_cos, rotary_sin, seqlens_rotary
+        None, None, None,                # q_descale, k_descale, v_descale
+        softmax_scale,
+        False,                           # is_causal — sparse contract: no mask
+        -1, -1, 0,                       # window_size_left/right, attention_chunk
+        0.0,                             # softcap
+        False,                           # is_rotary_interleaved
+        None,                            # scheduler_metadata
+        num_blocks,                      # num_splits — one split per block → per-block partials
+        None,                            # pack_gqa
+        sm_margin,
+        sparse_block_table,
+        block_size,
+    )
+    return o_partial, lse_partial
+
+
+def flash_attn_with_block_scores(
+    q,
+    k,
+    v,
+    block_scores,
+    top_k,
+    softmax_scale=None,
+    sm_margin=0,
+    block_size=128,
+    return_block_table=False,
+):
+    """Top-K block selection fused with sparse FA-3 forward.
+
+    Selects the `top_k` highest-scoring entries from `block_scores`,
+    builds a sparse block table (sorted ascending for monotone TMA
+    access), and runs the standard sparse FA-3 forward over those
+    blocks.
+
+    Args:
+        q: (batch, seqlen_q, nheads, head_size)
+        k: (batch, seqlen_k, nheads_k, head_size) — seqlen_k must be a
+            multiple of `block_size`.
+        v: (batch, seqlen_k, nheads_k, head_size_v)
+        block_scores: 1D float CUDA tensor with one entry per K/V block.
+            `block_scores[i]` is the score for the K/V slice
+            `k[:, i*block_size : (i+1)*block_size, ...]`. The caller is
+            responsible for setting entries corresponding to
+            non-historical blocks to -inf so they are never selected.
+        top_k: number of blocks to select. Clamped to len(block_scores).
+        softmax_scale: defaults to 1/sqrt(head_size).
+        sm_margin: passthrough to the kernel launch.
+        block_size: one of {16, 32, 64, 128, 256}.
+        return_block_table: if True, also return the selected indices.
+
+    Returns:
+        out: (batch, seqlen_q, nheads, head_size_v)
+        softmax_lse: (batch, nheads, seqlen_q)
+        block_table (optional): (top_k,) int32, selected indices sorted
+            ascending. Returned only when `return_block_table=True`.
+    """
+    assert block_scores.dim() == 1 and block_scores.is_cuda, (
+        "block_scores must be a 1D CUDA tensor"
+    )
+    top_k = min(int(top_k), block_scores.numel())
+    top_idx = torch.topk(block_scores, top_k, sorted=False).indices
+    block_table = top_idx.to(torch.int32).sort().values
+    out, softmax_lse = flash_attn_with_sparse_block_table(
+        q, k, v, block_table,
+        softmax_scale=softmax_scale,
+        sm_margin=sm_margin,
+        block_size=block_size,
+    )
+    if return_block_table:
+        return out, softmax_lse, block_table
     return out, softmax_lse
 
 

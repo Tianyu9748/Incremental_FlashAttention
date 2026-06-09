@@ -369,6 +369,37 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
     TORCH_CHECK(params.num_splits >= 1);
+
+    // Target 2 (Option A): sparse path with non-default block size routes
+    // to dedicated kernels compiled with kBlockN ∈ {16, 32, 64, 256}.
+    // The block_size = 128 path falls through to the existing dispatch
+    // (which reuses the dense build's kBlockN=128 instantiation).
+    if (params.sparse_block_table != nullptr
+        && params.sparse_block_size != 128
+        && params.sparse_block_size > 0) {
+        TORCH_CHECK(params.arch >= 90,
+                    "Sparse small-blockN path is SM90-only");
+        TORCH_CHECK(params.d == 128 && params.dv == 128,
+                    "Sparse small-blockN path currently supports hdim=128 only");
+        TORCH_CHECK(!params.is_e4m3,
+                    "Sparse small-blockN path supports fp16 / bf16 only");
+        TORCH_CHECK(params.softcap == 0.0f,
+                    "Sparse small-blockN path does not support softcap");
+        SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
+            SPARSE_BLOCK_N_SWITCH(params.sparse_block_size, kBlockN_sparse, [&] {
+                // PackGQA always enabled for Split per the dense convention
+                if (params.is_bf16) {
+                    run_mha_fwd_sparse_<90, cutlass::bfloat16_t, 128, 128, kBlockN_sparse,
+                                        Split, false /*Has_softcap*/, true /*PackGQA*/>(params, stream);
+                } else {
+                    run_mha_fwd_sparse_<90, cutlass::half_t, 128, 128, kBlockN_sparse,
+                                        Split, false /*Has_softcap*/, true /*PackGQA*/>(params, stream);
+                }
+            });
+        });
+        return;
+    }
+
     ARCH_SWITCH(params.arch, Arch, [&] {
         SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
             PAGEDKV_SWITCH(params.page_table && !params.pagedkv_tma, PagedKVNonTMA, [&] {
@@ -454,19 +485,30 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
     int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
     int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
+    // Sparse path: the CTA only visits sparse_num_blocks K-tiles regardless
+    // of seqlen_k. The contract (flash.h: sparse_block_table) guarantees
+    // every listed block is fully historical, so causal/local masking does
+    // not apply for the purposes of work sizing.
+    bool const use_sparse = params.sparse_block_table != nullptr;
     // If is_local, we're not going to load all of seqlen_k
     int const seqlen_k_loaded = !params.is_local
         ? params.seqlen_k
         : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
-    int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
+    int const num_n_blocks = use_sparse
+        ? std::max(1, params.sparse_num_blocks)
+        : (seqlen_k_loaded + kBlockN - 1) / kBlockN;
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
-    int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
+    int const k_tokens_for_bw = use_sparse
+        ? params.sparse_num_blocks * kBlockN
+        : params.seqlen_k;
+    int const size_one_kv_head = k_tokens_for_bw * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
+    bool const causal_or_local_eff = use_sparse ? false : (params.is_causal || params.is_local);
     // Always enable PackGQA for Split
     // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
     // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
     // that batch = 1.
     int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
-    return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
+    return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, causal_or_local_eff, 128);
     #endif
 }
 
@@ -705,7 +747,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
         int64_t sm_margin,
-        std::optional<at::Tensor> sparse_block_table_  // (sparse_num_blocks,) int32, see plan.md
+        std::optional<at::Tensor> sparse_block_table_,  // (sparse_num_blocks,) int32, see plan.md
+        int64_t sparse_block_size                       // Target 2: granularity of sparse_block_table entries (16/32/64/128/256)
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -948,6 +991,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     if (use_sparse) {
         params.sparse_block_table = sparse_block_table.data_ptr<int>();
         params.sparse_num_blocks = static_cast<int>(sparse_block_table.numel());
+        TORCH_CHECK(sparse_block_size == 16 || sparse_block_size == 32
+                        || sparse_block_size == 64 || sparse_block_size == 128
+                        || sparse_block_size == 256,
+                    "sparse_block_size must be one of {16, 32, 64, 128, 256}");
+        params.sparse_block_size = static_cast<int>(sparse_block_size);
+    } else {
+        params.sparse_block_size = 0;
     }
 
     if (k_new_.has_value()) {  // This needs to be set before get_pagedkv_tma
@@ -1730,7 +1780,8 @@ TORCH_LIBRARY(sparse_flash_attn_3, m) {
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0,"
-        "Tensor? sparse_block_table = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "Tensor? sparse_block_table = None,"
+        "int sparse_block_size = 128) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"

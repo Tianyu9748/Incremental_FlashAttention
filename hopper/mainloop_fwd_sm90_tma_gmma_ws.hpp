@@ -75,6 +75,31 @@ struct CollectiveMainloopFwdSm90 {
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
+    // Per-split slice of params.ptr_sparse_block_table for the sparse path.
+    // Returns {block_idx_begin, num_blocks}. Mirrors the 16-bit num_splits
+    // packing used by BlockMN::get_n_block_min_max (block.h:47-54), so the
+    // sparse producer (load_sparse) and consumer (mma_sparse) compute the
+    // same slice from the same split_idx.
+    static CUTLASS_DEVICE
+    cute::tuple<int, int> get_sparse_split_range(
+            int const split_idx, int const num_splits_param, int const sparse_total) {
+        if constexpr (!Split) {
+            return {0, sparse_total};
+        } else {
+            uint32_t num_splits_dynamic_u = reinterpret_cast<uint32_t const&>(split_idx) >> 16;
+            int num_splits_dynamic = reinterpret_cast<int&>(num_splits_dynamic_u);
+            int const split_idx_actual = split_idx & 0x0000FFFF;
+            int const num_splits_actual = num_splits_dynamic > 0 ? num_splits_dynamic : num_splits_param;
+            int const per_split = sparse_total <= 0
+                ? 0
+                : cute::ceil_div(sparse_total, num_splits_actual);
+            int const block_idx_begin = split_idx_actual * per_split;
+            int const block_idx_end = std::min(block_idx_begin + per_split, sparse_total);
+            int const num_blocks = std::max(0, block_idx_end - block_idx_begin);
+            return {block_idx_begin, num_blocks};
+        }
+    }
+
     static_assert(!LargeHeadDimV || kHeadDimV % 256 == 0);
     static_assert(!LargeHeadDimV || kBlockM <= 64, "kBlockM must be 64 or less for large Headdim_V");
     static_assert(!LargeHeadDimV || !MmaPV_is_RS, "MmaPV must be SS for large Headdim_V");
@@ -954,12 +979,21 @@ struct CollectiveMainloopFwdSm90 {
         static_assert(!Transpose_V, "sparse path does not support Transpose_V");
         static_assert(!LargeHeadDimV, "sparse path does not support LargeHeadDimV");
         static_assert(IntraWGOverlap, "sparse path requires IntraWGOverlap");
+        // Note: kBlockN ∈ {16, 32, 64, 128, 256} is enforced at the dispatch
+        // site (flash_api.cpp's SPARSE_BLOCK_N_SWITCH) and by generate_kernels.py
+        // explicit instantiations. A static_assert here is too aggressive because
+        // load_sparse is instantiated whenever SparsePathSupported is true,
+        // which covers dense configs with kBlockN ∈ {80, 96, 112, 144, 192, ...}.
 
         int const m_block = get<0>(block_coord);
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
+        int const split_idx = get<3>(block_coord);
 
-        const int num_blocks = params.sparse_num_blocks;
+        // Slice [0, sparse_num_blocks) into per-split contiguous ranges.
+        // When Split=false the slice is the full table (begin=0).
+        auto [block_idx_begin, num_blocks] = get_sparse_split_range(
+            split_idx, params.num_splits, params.sparse_num_blocks);
         if (num_blocks <= 0) {
             scheduler_prefetch();
             return;
@@ -1031,9 +1065,9 @@ struct CollectiveMainloopFwdSm90 {
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
 
         // First K load (IntraWGOverlap: V lags K by one stage, so V for
-        // sparse_block_table[0] is loaded AFTER the main loop as a trailing
+        // this CTA's first block is loaded AFTER the main loop as a trailing
         // load_V on the current smem_pipe_write).
-        int n_block = params.ptr_sparse_block_table[0];
+        int n_block = params.ptr_sparse_block_table[block_idx_begin];
         if (should_load_KV) { load_K(n_block, smem_pipe_write); }
 
         if constexpr (Use_TMA_Q) {
@@ -1064,7 +1098,7 @@ struct CollectiveMainloopFwdSm90 {
         int n_block_prev = n_block;
         #pragma unroll 1
         for (int i = 1; i < num_blocks; ++i) {
-            n_block = params.ptr_sparse_block_table[i];
+            n_block = params.ptr_sparse_block_table[block_idx_begin + i];
             PipelineState smem_pipe_write_v = smem_pipe_write;  // V is one stage behind
             ++smem_pipe_write;
             if (should_load_KV) {
@@ -1552,13 +1586,20 @@ struct CollectiveMainloopFwdSm90 {
 
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        // kBlockN ∈ {16, 32, 64, 128, 256} for sparse — see note in load_sparse.
 
         int const m_block = get<0>(block_coord);
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
+        int const split_idx = get<3>(block_coord);
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
 
-        const int num_blocks = params.sparse_num_blocks;
+        // MMA consumer only needs the per-split block COUNT — it consumes
+        // whatever sits in smem in pipeline order. Must match load_sparse's
+        // slice (same helper, same inputs).
+        auto [block_idx_begin_unused, num_blocks] = get_sparse_split_range(
+            split_idx, params.num_splits, params.sparse_num_blocks);
+        (void)block_idx_begin_unused;
         if (num_blocks <= 0) { return false; }  // epilogue store_zero writes O=0, LSE=-inf
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});

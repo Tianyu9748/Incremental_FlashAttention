@@ -29,8 +29,11 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         } else if (headdim <= 96) {
             return {192, is_local || paged_kv_non_TMA ? 128 : 144, false, true};
         } else if (headdim <= 128) {
-            bool const use_blockN_128 = is_causal || is_local || paged_kv_non_TMA;
-            return {128, use_blockN_128 ? 128 : 176, true, true};
+            // Forced kBlockN=128 (was: 128 if causal/local/paged_kv_non_TMA else 176).
+            // Smaller kBlockN gives finer per-CTA work granularity, which helps
+            // sparse / decode workloads where Sq=1 leaves the M dim under-filled.
+            // May regress dense long-Sq prefill throughput.
+            return {128, 128, true, true};
             // {128, 192, true, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if MmaPV_is_RS, 128 x 144 hits the limit if !MmaPV_is_RS
         } else if (headdim <= 192) {

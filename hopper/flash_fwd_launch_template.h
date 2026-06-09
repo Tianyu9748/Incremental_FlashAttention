@@ -27,7 +27,9 @@ using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
-          bool PackGQA, bool Split, bool V_colmajor>
+          bool PackGQA, bool Split, bool V_colmajor,
+          int kBlockN_override = 0,     // Target 2: when > 0, replaces tile_size_fwd_sm90's kBlockN
+          int kStages_override  = 0>    // Target 2: when > 0, replaces the default kStages (needed for kBlockN=256)
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
@@ -40,11 +42,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap);
     static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen && Split, Has_softcap, AppendKV);
     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
-    static constexpr int kBlockN = Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kBlockN_auto = Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kBlockN = kBlockN_override > 0 ? kBlockN_override : kBlockN_auto;
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
-    static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kStages_default = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kStages = kStages_override > 0 ? kStages_override : kStages_default;
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
@@ -197,6 +201,38 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
                                            Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl /*launch_with_pdl*/));
     }
+}
+
+// Sparse-only entry (Target 2 Option A). One variant per
+// kBlockN ∈ {16, 32, 64, 256}; kBlockN=128 uses the regular run_mha_fwd_.
+// Restricts the axes the sparse path actually needs (no causal/local,
+// no varlen, no paged KV, no AppendKV/HasQv/V_colmajor), so each
+// instantiation compiles a single concrete kernel body.
+template<int Arch, typename T, int kHeadDim, int kHeadDimV, int kBlockN_sparse,
+         bool Split, bool Has_softcap, bool PackGQA>
+void run_mha_fwd_sparse_(Flash_fwd_params &params, cudaStream_t stream) {
+    static_assert(sizeof(T) == 2, "sparse path supports fp16 / bf16 only");
+    static_assert(Arch >= 90, "sparse path is SM90-only (requires IntraWGOverlap)");
+    static_assert(kBlockN_sparse == 16 || kBlockN_sparse == 32
+                      || kBlockN_sparse == 64 || kBlockN_sparse == 256,
+                  "run_mha_fwd_sparse_ only instantiates for non-128 kBlockN");
+    using T_out = T;
+    static constexpr bool Is_causal      = false;
+    static constexpr bool Is_local       = false;
+    static constexpr bool V_colmajor     = false;
+    static constexpr bool Varlen         = false;
+    static constexpr bool PagedKVNonTMA  = false;
+    static constexpr bool AppendKV       = false;
+    static constexpr bool HasQv          = false;
+    static constexpr int  ClusterM       = 1;
+    // kBlockN=256 doesn't fit smem with 2 stages at hdim=128 bf16
+    // (~288 KB > Hopper's ~227 KB limit). Drop pipelining to one stage;
+    // the workload is HBM-bound at decode, so the loss is minor.
+    static constexpr int kStages_sparse = (kBlockN_sparse == 256) ? 1 : 2;
+    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out,
+                  Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA,
+                  AppendKV, HasQv, PackGQA, Split, V_colmajor,
+                  kBlockN_sparse, kStages_sparse>(params, stream);
 }
 
 template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
