@@ -138,6 +138,16 @@ pytest tests/test_flash_attn.py
 If you use this work, please also cite the upstream FlashAttention papers it is built on:
 
 ```bibtex
+@misc{wang2026predictreuserepairaccelerating,
+      title={Predict, Reuse, and Repair: Accelerating Dynamic Sparse Attention for Long-Context LLM Decoding}, 
+      author={Tianyu Wang and Gourav Rattihalli and Aditya Dhakal and Junbo Li and Zhiwei Ren and Dejan Milojicic and Longfei Shangguan},
+      year={2026},
+      eprint={2606.30389},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2606.30389}, 
+}
+
 @inproceedings{dao2022flashattention,
   title={FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness},
   author={Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
@@ -157,7 +167,7 @@ If you use this work, please also cite the upstream FlashAttention papers it is 
   year={2024}
 }
 ```
-
+- Predict, Reuse, and Repair: https://arxiv.org/pdf/2606.30389v1
 - FlashAttention paper: https://arxiv.org/abs/2205.14135
 - FlashAttention-2 paper: https://tridao.me/publications/flash2/flash2.pdf
 - FlashAttention-3 paper: https://tridao.me/publications/flash3/flash3.pdf
